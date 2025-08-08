@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    networks:
+      - latexnet
+    depends_on:
+      - api-service
+
+  api-service:
+    build:
+      context: ./api-service
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    networks:
+      - latexnet
+    volumes:
+      - ./latex_files:/app/latex_files
+    environment:
+      - LATEX_FILES_DIR=/app/latex_files
+      - STATIC_FILES_ROUTE=/files
+    depends_on:
+      - latex-compiler
+
+  latex-compiler:
+    build:
+      context: ./latex-compiler
+      dockerfile: Dockerfile
+    container_name: latex-compiler
+    networks:
+      - latexnet
+    volumes:
+      - ./latex_files:/work/latex_files
+    environment:
+      - LATEX_WORK_DIR=/work/latex_files
+
+networks:
+  latexnet:
+    driver: bridge
