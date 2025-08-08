@@ -180,7 +180,9 @@ function App() {
       }),
     })
     if (r.ok) {
-      setStatus('Saved')
+      setStatus('Saved — compiling...')
+      // Trigger compile via WebSocket after successful save
+      wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision })
     } else {
       setStatus(`Save failed: ${r.status}`)
     }
