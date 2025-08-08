@@ -2,11 +2,9 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,12 +39,13 @@ var (
 )
 
 type Project struct {
-	ProjectID string    `json:"projectId"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-	Engine    string    `json:"engine,omitempty"`
-	EntryFile string    `json:"entryFile,omitempty"`
+	ProjectID    string    `json:"id"`
+	Name         string    `json:"name"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+	Engine       string    `json:"engine,omitempty"`
+	EntryFile    string    `json:"entryFile,omitempty"`
+	LastModified time.Time `json:"lastModified"`
 }
 
 type FileInfo struct {
@@ -99,13 +98,12 @@ type WSPing struct {
 }
 
 type WSAck struct {
-	Type      string            `json:"type"` // "ack"
-	ProjectID string            `json:"projectId"`
-	TS        string            `json:"ts"`
-	Op        string            `json:"op"`
-	Revision  string            `json:"revision,omitempty"`
-	Error     *map[string]any   `json:"error,omitempty"`
-	Extras    map[string]string `json:"-"`
+	Type      string         `json:"type"` // "ack"
+	ProjectID string         `json:"projectId"`
+	TS        string         `json:"ts"`
+	Op        string         `json:"op"`
+	Revision  any            `json:"revision,omitempty"`
+	Error     map[string]any `json:"error,omitempty"`
 }
 
 type CompileQueued struct {
@@ -129,9 +127,7 @@ type CompileProgress struct {
 	TS        string `json:"ts"`
 	JobID     string `json:"jobId"`
 	Revision  string `json:"revision"`
-	Pct       *int   `json:"pct,omitempty"`
 	Message   string `json:"message,omitempty"`
-	LogTail   string `json:"logTail,omitempty"`
 }
 type CompileSucceeded struct {
 	Type       string `json:"type"` // "compileSucceeded"
@@ -139,29 +135,24 @@ type CompileSucceeded struct {
 	TS         string `json:"ts"`
 	JobID      string `json:"jobId"`
 	Revision   string `json:"revision"`
-	PDFURL     string `json:"pdfUrl"`
-	Duration   int64  `json:"durationMs"`
-	FinishedAt string `json:"finishedAt"`
 	OutputPath string `json:"outputPath,omitempty"`
+	FinishedAt string `json:"finishedAt"`
 }
 type CompileFailed struct {
-	Type       string                   `json:"type"` // "compileFailed"
-	ProjectID  string                   `json:"projectId"`
-	TS         string                   `json:"ts"`
-	JobID      string                   `json:"jobId"`
-	Revision   string                   `json:"revision"`
-	Errors     []map[string]interface{} `json:"errors,omitempty"`
-	LogURL     string                   `json:"logUrl,omitempty"`
-	Duration   int64                    `json:"durationMs"`
-	FinishedAt string                   `json:"finishedAt"`
-	Error      string                   `json:"error,omitempty"`
+	Type       string `json:"type"` // "compileFailed"
+	ProjectID  string `json:"projectId"`
+	TS         string `json:"ts"`
+	JobID      string `json:"jobId"`
+	Revision   string `json:"revision"`
+	Error      string `json:"error,omitempty"`
+	FinishedAt string `json:"finishedAt"`
 }
 type CompileCanceled struct {
-	Type               string `json:"type"` // "compileCanceled"
-	ProjectID          string `json:"projectId"`
-	TS                 string `json:"ts"`
-	JobID              string `json:"jobId"`
-	SupersededRevision string `json:"supersededByRevision"`
+	Type      string `json:"type"` // "compileCanceled"
+	ProjectID string `json:"projectId"`
+	TS        string `json:"ts"`
+	JobID     string `json:"jobId"`
+	Revision  string `json:"revision"`
 }
 type WSPong struct {
 	Type      string `json:"type"` // "pong"
@@ -204,17 +195,9 @@ type CancelRequest struct {
 	Revision string `json:"revision,omitempty"`
 }
 
-type ProjectListItem struct {
-	ProjectID string    `json:"projectId"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-}
-
 type ProjectsCreateBody struct {
 	Name     string `json:"name"`
 	Template string `json:"template"`
-	Engine   string `json:"engine"`
 }
 
 type ProjectDetail struct {
@@ -267,28 +250,22 @@ func (pr *projectRegistry) setBuffer(projectID, entry, content string) {
 func main() {
 	log.Printf("api-service starting on :%s, LATEX_FILES_DIR=%s", defaultAPIPort, latexRoot)
 
-	// Ensure base directory
 	if err := os.MkdirAll(latexRoot, 0o755); err != nil {
 		log.Fatalf("failed to ensure latex root: %v", err)
 	}
 
 	mux := http.NewServeMux()
 
-	// REST: Health and Version
 	mux.HandleFunc(apiPrefix+"/health", handleHealth)
 	mux.HandleFunc(apiPrefix+"/version", handleVersion)
-
-	// REST: Projects
 	mux.HandleFunc(apiPrefix+"/projects", routeProjects)
+	mux.HandleFunc(apiPrefix+"/projects/import", handleImportProject)
 	mux.HandleFunc(apiPrefix+"/projects/", routeProjectByID)
 
-	// Static files under /files/*
 	mux.HandleFunc(filesPrefix+"/", handleFiles)
-
-	// WebSocket
 	mux.HandleFunc(wsPrefix+"/projects/", handleWSProjects)
 
-	// Also provide legacy /health for current frontend default
+	// Legacy health for frontend
 	mux.HandleFunc("/health", handleHealth)
 
 	addr := ":" + defaultAPIPort
@@ -308,18 +285,13 @@ func handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"api": version})
 }
 
-// --- helpers added below ---
-
-// writeJSON writes JSON with status and sets headers.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	if v == nil {
-		return
+	if v != nil {
+		json.NewEncoder(w).Encode(v)
 	}
-	enc := json.NewEncoder(w)
-	_ = enc.Encode(v)
 }
 
 func getProject(projectID string) *Project {
@@ -330,33 +302,43 @@ func getProject(projectID string) *Project {
 
 func defaultTemplate(t string) string {
 	switch strings.ToLower(t) {
-	case "book":
-		return `\documentclass{book}
+	case "report":
+		return `\documentclass{report}
 \begin{document}
-\chapter{Title}
-Hello, book.
+\title{My Report}
+\author{Author}
+\maketitle
+\chapter{Introduction}
+This is the introduction.
 \end{document}
 `
-	case "empty":
-		return `\documentclass{article}
+	case "beamer":
+		return `\documentclass{beamer}
+\usetheme{Madrid}
+\title{My Presentation}
+\author{Author}
+\date{\today}
 \begin{document}
+\frame{\titlepage}
+\section{Introduction}
+\begin{frame}{First Slide}
+Hello, Beamer!
+\end{frame}
 \end{document}
 `
 	default:
 		return `\documentclass{article}
 \begin{document}
-Hello, LaTeX.
+Hello, LaTeX!
 \end{document}
 `
 	}
 }
 
-// genToken creates a short opaque token suitable for revisions when client omits.
 func genToken() string {
 	return uuid()
 }
 
-// Projects routing
 func routeProjects(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
@@ -368,15 +350,115 @@ func routeProjects(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func handleImportProject(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10 MB limit
+		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid form", "bad_request"})
+		return
+	}
+
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorBody{"missing file", "bad_request"})
+		return
+	}
+	defer file.Close()
+
+	projectName := strings.TrimSuffix(handler.Filename, filepath.Ext(handler.Filename))
+
+	id := uuid()
+	now := time.Now().UTC()
+	p := &Project{
+		ProjectID:    id,
+		Name:         projectName,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastModified: now,
+		Engine:       "pdflatex",
+		EntryFile:    "main.tex",
+	}
+
+	root := projectDir(id)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to create project directory", "internal_error"})
+		return
+	}
+
+	zipReader, err := zip.NewReader(file, handler.Size)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid zip file", "bad_zip"})
+		return
+	}
+
+	for _, f := range zipReader.File {
+		fpath := filepath.Join(root, f.Name)
+
+		if !strings.HasPrefix(fpath, filepath.Clean(root)+string(os.PathSeparator)) {
+			writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid file path in zip", "bad_zip_path"})
+			return
+		}
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to create directory from zip", "internal_error"})
+			return
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to create file from zip", "internal_error"})
+			return
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to open file in zip", "internal_error"})
+			return
+		}
+
+		_, err = io.Copy(outFile, rc)
+
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to write file from zip", "internal_error"})
+			return
+		}
+	}
+
+	createCompileDirs(root)
+
+	projectState.mu.Lock()
+	projectState.projects[id] = p
+	projectState.mu.Unlock()
+
+	writeJSON(w, http.StatusCreated, p)
+}
+
+func createCompileDirs(root string) {
+	dirs := []string{"compile/queue", "compile/working", "compile/logs", "compile/status"}
+	for _, d := range dirs {
+		os.MkdirAll(filepath.Join(root, d), 0o755)
+	}
+}
+
 func routeProjectByID(w http.ResponseWriter, r *http.Request) {
-	// /api/projects/{id}/...
-	rest := strings.TrimPrefix(r.URL.Path, apiPrefix+"/projects/")
-	parts := strings.Split(rest, "/")
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, apiPrefix+"/projects/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"missing projectId", "invalid_request"})
 		return
 	}
 	projectID := parts[0]
+
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:
@@ -388,13 +470,8 @@ func routeProjectByID(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
 	switch parts[1] {
-	case "tree":
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
-			return
-		}
-		handleProjectTree(w, r, projectID)
 	case "files":
 		switch r.Method {
 		case http.MethodGet:
@@ -405,26 +482,8 @@ func routeProjectByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
 		}
 	case "compile":
-		if len(parts) == 2 {
-			if r.Method != http.MethodPost {
-				writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
-				return
-			}
-			handleCompile(w, r, projectID)
-		} else if len(parts) == 3 && parts[2] == "cancel" {
-			if r.Method != http.MethodPost {
-				writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
-				return
-			}
-			handleCompileCancel(w, r, projectID)
-		} else {
-			writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		}
+		handleCompile(w, r, projectID)
 	case "download":
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
-			return
-		}
 		handleProjectDownload(w, r, projectID)
 	default:
 		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
@@ -439,69 +498,35 @@ func handleProjectDownload(w http.ResponseWriter, r *http.Request, projectID str
 		return
 	}
 	root := projectDir(projectID)
-	// Set headers for zip download
 	w.Header().Set("Content-Type", "application/zip")
-	// sanitize name for filename
-	fname := projectID + ".zip"
-	if p.Name != "" {
-		safeName := strings.ReplaceAll(p.Name, " ", "_")
-		safeName = strings.Map(func(r rune) rune {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
-				return r
-			}
-			return '-'
-		}, safeName)
-		fname = safeName + "-" + projectID + ".zip"
-	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fname))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", p.Name+".zip"))
 
 	zw := zip.NewWriter(w)
 	defer zw.Close()
-	// Walk project and add files (skip transient compile artifacts)
+
 	filepath.WalkDir(root, func(pth string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		// skip root
-		if pth == root {
+		if err != nil || pth == root {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, pth)
-		rel = filepath.ToSlash(rel)
-		// Skip transient dirs and files
-		if rel == "compile/working" || strings.HasPrefix(rel, "compile/working/") {
-			return nil
-		}
-		if rel == "compile/queue" || strings.HasPrefix(rel, "compile/queue/") {
-			return nil
-		}
-		if rel == "compile/status" || strings.HasPrefix(rel, "compile/status/") {
-			return nil
-		}
-		if strings.HasSuffix(rel, ".cancel") {
+		// Skip compile artifacts
+		if strings.HasPrefix(rel, "compile") {
 			return nil
 		}
 		if d.IsDir() {
-			// create directory entry to preserve structure (optional)
-			_, _ = zw.Create(rel + "/")
-			return nil
+			_, err := zw.Create(rel + "/")
+			return err
 		}
-		// add file
 		f, err := os.Open(pth)
 		if err != nil {
 			return nil
 		}
 		defer f.Close()
-		hdr, err := zip.FileInfoHeader(mustStat(f))
-		if err != nil {
-			return nil
-		}
+		info, _ := f.Stat()
+		hdr, _ := zip.FileInfoHeader(info)
 		hdr.Name = rel
 		hdr.Method = zip.Deflate
-		wtr, err := zw.CreateHeader(hdr)
-		if err != nil {
-			return nil
-		}
+		wtr, _ := zw.CreateHeader(hdr)
 		_, _ = io.Copy(wtr, f)
 		return nil
 	})
@@ -509,95 +534,48 @@ func handleProjectDownload(w http.ResponseWriter, r *http.Request, projectID str
 
 func handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	var body ProjectsCreateBody
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
 		return
 	}
 	if body.Name == "" {
 		body.Name = "Untitled Project"
 	}
-	if body.Template == "" {
-		body.Template = "article"
-	}
-	if body.Engine == "" {
-		body.Engine = "pdflatex"
-	}
+
 	id := uuid()
 	now := time.Now().UTC()
 	p := &Project{
-		ProjectID: id,
-		Name:      body.Name,
-		CreatedAt: now,
-		UpdatedAt: now,
-		Engine:    body.Engine,
-		EntryFile: "main.tex",
+		ProjectID:    id,
+		Name:         body.Name,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastModified: now,
+		Engine:       "pdflatex",
+		EntryFile:    "main.tex",
 	}
-	// create directory
+
 	root := projectDir(id)
-	if err := os.MkdirAll(filepath.Join(root, "assets"), 0o755); err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to create project", "internal_error"})
-		return
-	}
-	compileDirs := []string{
-		filepath.Join(root, "compile", "queue"),
-		filepath.Join(root, "compile", "working"),
-		filepath.Join(root, "compile", "logs"),
-		filepath.Join(root, "compile", "status"),
-	}
-	for _, d := range compileDirs {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to create compile dirs", "internal_error"})
-			return
-		}
-	}
+	os.MkdirAll(filepath.Join(root, "assets"), 0o755)
+	createCompileDirs(root)
+
 	seed := defaultTemplate(body.Template)
-	if err := os.WriteFile(filepath.Join(root, "main.tex"), []byte(seed), 0o644); err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to write main.tex", "internal_error"})
-		return
-	}
-	// register
+	os.WriteFile(filepath.Join(root, "main.tex"), []byte(seed), 0o644)
+
 	projectState.mu.Lock()
 	projectState.projects[id] = p
 	projectState.mu.Unlock()
 
-	resp := map[string]any{
-		"projectId": id,
-		// include short key expected by some frontends
-		"id":        id,
-		"name":      p.Name,
-		"createdAt": p.CreatedAt.Format(time.RFC3339),
-		"updatedAt": p.UpdatedAt.Format(time.RFC3339),
-	}
-	writeJSON(w, http.StatusCreated, resp)
+	writeJSON(w, http.StatusCreated, p)
 }
 
 func handleListProjects(w http.ResponseWriter, r *http.Request) {
-	page := parseIntDefault(r.URL.Query().Get("page"), 1)
-	pageSize := clamp(parseIntDefault(r.URL.Query().Get("pageSize"), 20), 1, 100)
-	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
 	projectState.mu.RLock()
 	defer projectState.mu.RUnlock()
-	var list []ProjectListItem
+	var list []*Project
 	for _, p := range projectState.projects {
-		if search != "" && !strings.Contains(strings.ToLower(p.Name), search) {
-			continue
-		}
-		list = append(list, ProjectListItem{
-			ProjectID: p.ProjectID,
-			Name:      p.Name,
-			CreatedAt: p.CreatedAt,
-			UpdatedAt: p.UpdatedAt,
-		})
+		list = append(list, p)
 	}
-	start := (page - 1) * pageSize
-	if start > len(list) {
-		start = len(list)
-	}
-	end := start + pageSize
-	if end > len(list) {
-		end = len(list)
-	}
-	writeJSON(w, http.StatusOK, list[start:end])
+	writeJSON(w, http.StatusOK, map[string]any{"projects": list})
 }
 
 func handleGetProject(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -606,43 +584,7 @@ func handleGetProject(w http.ResponseWriter, r *http.Request, projectID string) 
 		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
 		return
 	}
-	files := []FileInfo{}
-	root := projectDir(projectID)
-	filepath.WalkDir(root, func(pth string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if pth == root {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, pth)
-		if rel == "." {
-			return nil
-		}
-		fi, _ := d.Info()
-		info := FileInfo{Path: filepath.ToSlash(rel)}
-		if d.IsDir() {
-			info.Type = "dir"
-		} else {
-			info.Type = "file"
-			if fi != nil {
-				info.Size = fi.Size()
-				info.UpdatedAt = fi.ModTime().UTC()
-			}
-		}
-		files = append(files, info)
-		return nil
-	})
-	resp := ProjectDetail{
-		ProjectID: p.ProjectID,
-		Name:      p.Name,
-		CreatedAt: p.CreatedAt,
-		UpdatedAt: p.UpdatedAt,
-		Engine:    coalesce(p.Engine, "pdflatex"),
-		EntryFile: coalesce(p.EntryFile, "main.tex"),
-		Files:     files,
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, p)
 }
 
 func handleDeleteProject(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -650,11 +592,7 @@ func handleDeleteProject(w http.ResponseWriter, r *http.Request, projectID strin
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// simple delete: remove directory
-	if err := os.RemoveAll(projectDir(projectID)); err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorBody{"delete failed", "internal_error"})
-		return
-	}
+	os.RemoveAll(projectDir(projectID))
 	projectState.mu.Lock()
 	delete(projectState.projects, projectID)
 	delete(projectState.revisions, projectID)
@@ -663,56 +601,8 @@ func handleDeleteProject(w http.ResponseWriter, r *http.Request, projectID strin
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func handleProjectTree(w http.ResponseWriter, r *http.Request, projectID string) {
-	if getProject(projectID) == nil {
-		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		return
-	}
-	root := projectDir(projectID)
-	entries := []FileInfo{}
-	err := filepath.WalkDir(root, func(pth string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if pth == root {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, pth)
-		if rel == "." {
-			return nil
-		}
-		fi, _ := d.Info()
-		item := FileInfo{
-			Path: filepath.ToSlash(rel),
-		}
-		if d.IsDir() {
-			item.Type = "dir"
-		} else {
-			item.Type = "file"
-			if fi != nil {
-				item.Size = fi.Size()
-			}
-		}
-		entries = append(entries, item)
-		return nil
-	})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, ErrorBody{"failed to read tree", "internal_error"})
-		return
-	}
-	writeJSON(w, http.StatusOK, entries)
-}
-
 func handleGetFile(w http.ResponseWriter, r *http.Request, projectID string) {
-	if getProject(projectID) == nil {
-		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		return
-	}
 	pth := r.URL.Query().Get("path")
-	if pth == "" {
-		writeJSON(w, http.StatusBadRequest, ErrorBody{"missing path", "invalid_request"})
-		return
-	}
 	full, ok := safeJoin(projectDir(projectID), pth)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid path", "invalid_path"})
@@ -720,31 +610,16 @@ func handleGetFile(w http.ResponseWriter, r *http.Request, projectID string) {
 	}
 	b, err := os.ReadFile(full)
 	if err != nil {
-		if os.IsNotExist(err) {
-			writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, ErrorBody{"read failed", "internal_error"})
+		writeJSON(w, http.StatusNotFound, ErrorBody{"file not found", "not_found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"path":    filepath.ToSlash(pth),
-		"content": string(b),
-	})
+	writeJSON(w, http.StatusOK, map[string]any{"path": pth, "content": string(b)})
 }
 
 func handlePutFiles(w http.ResponseWriter, r *http.Request, projectID string) {
-	if getProject(projectID) == nil {
-		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		return
-	}
 	var body PutFilesBody
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 10<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
-		return
-	}
-	if len(body.Files) == 0 {
-		writeJSON(w, http.StatusBadRequest, ErrorBody{"no files", "invalid_request"})
 		return
 	}
 	root := projectDir(projectID)
@@ -752,42 +627,23 @@ func handlePutFiles(w http.ResponseWriter, r *http.Request, projectID string) {
 	for _, f := range body.Files {
 		full, ok := safeJoin(root, f.Path)
 		if !ok {
-			writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid path", "invalid_path"})
-			return
+			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-			writeJSON(w, http.StatusInternalServerError, ErrorBody{"mkdir failed", "internal_error"})
-			return
-		}
-		if err := os.WriteFile(full, []byte(f.Content), 0o644); err != nil {
-			writeJSON(w, http.StatusInternalServerError, ErrorBody{"write failed", "internal_error"})
-			return
-		}
-		saved = append(saved, SavedFile{Path: filepath.ToSlash(f.Path), Bytes: len(f.Content)})
+		os.MkdirAll(filepath.Dir(full), 0o755)
+		os.WriteFile(full, []byte(f.Content), 0o644)
+		saved = append(saved, SavedFile{Path: f.Path, Bytes: len(f.Content)})
 	}
 	writeJSON(w, http.StatusOK, SavedFilesResp{Saved: saved})
 }
 
 func handleCompile(w http.ResponseWriter, r *http.Request, projectID string) {
-	if getProject(projectID) == nil {
+	p := getProject(projectID)
+	if p == nil {
 		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
 		return
 	}
-	var body CompileRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
-		return
-	}
-	rev := body.Revision
-	if rev == "" {
-		rev = projectState.getLatestRevision(projectID)
-	}
-	latest := projectState.getLatestRevision(projectID)
-	// accept even if rev != latest; the WS path guards enqueue, REST says enqueue for provided or current revision
-	if rev == "" {
-		rev = latest
-	}
-	jobID, err := enqueueJob(projectID, coalesce(body.EntryFile, "main.tex"), coalesce(body.Engine, "pdflatex"), rev, "rest:"+r.RemoteAddr)
+	rev := projectState.getLatestRevision(projectID)
+	jobID, err := enqueueJob(projectID, p.EntryFile, p.Engine, rev, "rest")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, ErrorBody{"enqueue failed", "internal_error"})
 		return
@@ -795,79 +651,33 @@ func handleCompile(w http.ResponseWriter, r *http.Request, projectID string) {
 	writeJSON(w, http.StatusAccepted, CompileAccepted{JobID: jobID, Revision: rev})
 }
 
-func handleCompileCancel(w http.ResponseWriter, r *http.Request, projectID string) {
-	if getProject(projectID) == nil {
-		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		return
-	}
-	var body CancelRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
-		return
-	}
-	ok := false
-	if body.JobID != "" {
-		ok = writeCancelFile(projectID, body.JobID) == nil
-	} else if body.Revision != "" {
-		// cancel any job older than revision => this minimal impl: write global cancel marker by scanning status dir (omitted)
-		ok = true
-	}
-	writeJSON(w, http.StatusAccepted, map[string]bool{"canceled": ok})
-}
-
-// Static file server for /files/{projectId}/...
 func handleFiles(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, filesPrefix+"/")
-	parts := strings.SplitN(rest, "/", 2)
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, filesPrefix+"/"), "/", 2)
 	if len(parts) < 2 {
 		http.NotFound(w, r)
 		return
 	}
-	projectID := parts[0]
-	rel := parts[1]
-	root := projectDir(projectID)
-	full, ok := safeJoin(root, rel)
+	projectID, rel := parts[0], parts[1]
+	full, ok := safeJoin(projectDir(projectID), rel)
 	if !ok {
-		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid path", "invalid_path"})
+		http.NotFound(w, r)
 		return
 	}
-	// set cache control as no-store
 	w.Header().Set("Cache-Control", "no-store")
-	// set content type via extension
 	if ct := mime.TypeByExtension(filepath.Ext(full)); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
 	http.ServeFile(w, r, full)
 }
 
-// WebSocket handler: /ws/projects/{projectId}?token=...
 func handleWSProjects(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, wsPrefix+"/projects/") {
-		http.NotFound(w, r)
-		return
-	}
 	projectID := strings.TrimPrefix(r.URL.Path, wsPrefix+"/projects/")
-	if i := strings.Index(projectID, "/"); i >= 0 {
-		projectID = projectID[:i]
-	}
 	if projectID == "" {
 		http.Error(w, "missing projectId", http.StatusBadRequest)
 		return
 	}
-	// Echo subprotocol if provided
-	subproto := ""
-	for _, p := range websocket.Subprotocols(r) {
-		if p == "live-latex-v1" {
-			subproto = p
-			break
-		}
-	}
-	up := upgrader
-	up.Subprotocols = nil // Upgrader decides based on CheckOrigin; we manually set response protocol via header
-	if subproto != "" {
-		w.Header().Set("Sec-WebSocket-Protocol", subproto)
-	}
-	c, err := up.Upgrade(w, r, w.Header())
+
+	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade error: %v", err)
 		return
@@ -877,143 +687,56 @@ func handleWSProjects(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// token accepted but not validated (future-proof)
-	_ = r.URL.Query().Get("token")
-
-	// Listen loop
 	for {
 		_, data, err := c.ReadMessage()
 		if err != nil {
-			if !websocket.IsCloseError(err, websocket.CloseNormalClosure) && !errors.Is(err, io.EOF) {
-				log.Printf("ws read error: %v", err)
-			}
 			return
 		}
-		// generic decode for flexible client payloads
+
 		var payload map[string]any
-		if err := json.Unmarshal(data, &payload); err != nil {
-			_ = sendAck(c, projectID, "unknown", nil, map[string]any{"message": "invalid json", "code": "invalid_message"})
+		if json.Unmarshal(data, &payload) != nil {
 			continue
 		}
 		t, _ := payload["type"].(string)
+
 		switch t {
 		case "docUpdate":
-			// extract fields allowing both path/entryFile and number/string revision
 			content, _ := payload["content"].(string)
-			if len(content) > maxDocUpdateSize {
-				_ = sendAck(c, projectID, "docUpdate", nil, map[string]any{"message": "too large", "code": "size_limit_exceeded"})
-				_ = c.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "payload too large"), time.Now().Add(time.Second))
-				continue
-			}
-			// determine entry file from either path or entryFile
-			entry := ""
-			if pth, ok := payload["path"].(string); ok && pth != "" {
-				entry = pth
-			}
-			if ef, ok := payload["entryFile"].(string); ok && ef != "" {
-				entry = ef
-			}
+			entry, _ := payload["path"].(string)
 			if entry == "" {
 				entry = "main.tex"
 			}
-			// revision: accept number or string
 			var revStr string
-			var ackRev any
 			switch rv := payload["revision"].(type) {
 			case float64:
-				// JSON numbers decode to float64
 				revStr = strconv.FormatInt(int64(rv), 10)
-				ackRev = rv
 			case string:
 				revStr = rv
-				ackRev = rv
 			default:
 				revStr = genToken()
-				ackRev = revStr
 			}
 			projectState.setLatestRevision(projectID, revStr)
 			projectState.setBuffer(projectID, entry, content)
-			// write latest.token
-			if err := os.WriteFile(filepath.Join(projectDir(projectID), "compile", "latest.token"), []byte(revStr), 0o644); err != nil {
-				log.Printf("write latest.token error: %v", err)
-			}
-			_ = sendAck(c, projectID, "docUpdate", ackRev, nil)
+			sendAck(c, projectID, "docUpdate", payload["revision"], nil)
+
 		case "requestCompile":
-			// allow flexible fields; always compile the latest revision to keep preview live
-			engine := "pdflatex"
-			if e, ok := payload["engine"].(string); ok && e != "" {
-				engine = e
+			entry, _ := payload["path"].(string)
+			if entry == "" {
+				entry = "main.tex"
 			}
-			entry := "main.tex"
-			if pth, ok := payload["path"].(string); ok && pth != "" {
-				entry = pth
-			}
-			if ef, ok := payload["entryFile"].(string); ok && ef != "" {
-				entry = ef
-			}
-			latest := projectState.getLatestRevision(projectID)
-			// prefer provided revision if it equals latest; otherwise force latest
-			var ackRev any
-			switch rv := payload["revision"].(type) {
-			case float64:
-				if strconv.FormatInt(int64(rv), 10) == latest {
-					ackRev = rv
-				} else {
-					ackRev = latest
-				}
-			case string:
-				if rv == latest {
-					ackRev = rv
-				} else {
-					ackRev = latest
-				}
-			default:
-				ackRev = latest
-			}
-			revStr := latest
-			jobID, err := enqueueJob(projectID, entry, engine, revStr, "ws")
+			revStr := projectState.getLatestRevision(projectID)
+			jobID, err := enqueueJob(projectID, entry, "pdflatex", revStr, "ws")
 			if err != nil {
-				_ = sendAck(c, projectID, "requestCompile", ackRev, map[string]any{"message": "enqueue failed", "code": "internal_error"})
+				sendAck(c, projectID, "requestCompile", payload["revision"], map[string]any{"message": "enqueue failed"})
 				continue
 			}
-			_ = sendAck(c, projectID, "requestCompile", ackRev, nil)
+			sendAck(c, projectID, "requestCompile", payload["revision"], nil)
 			now := time.Now().UTC().Format(time.RFC3339)
-			_ = c.WriteJSON(CompileQueued{Type: "compileQueued", ProjectID: projectID, TS: now, JobID: jobID, Revision: revStr})
-			// kick a lightweight status watcher to emit started/progress/succeeded if status files appear
+			c.WriteJSON(CompileQueued{Type: "compileQueued", ProjectID: projectID, TS: now, JobID: jobID, Revision: revStr})
 			go watchJobStatus(ctx, c, projectID, jobID, revStr)
-		case "save":
-			// support save via WS with { files: [{ path, content }] }
-			files, ok := payload["files"].([]any)
-			if !ok || len(files) == 0 {
-				_ = sendAck(c, projectID, "save", nil, map[string]any{"message": "no files", "code": "invalid_message"})
-				continue
-			}
-			for _, it := range files {
-				fm, ok := it.(map[string]any)
-				if !ok {
-					continue
-				}
-				pth, _ := fm["path"].(string)
-				cnt, _ := fm["content"].(string)
-				full, ok := safeJoin(projectDir(projectID), pth)
-				if !ok {
-					_ = sendAck(c, projectID, "save", nil, map[string]any{"message": "invalid path", "code": "invalid_path"})
-					continue
-				}
-				if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-					_ = sendAck(c, projectID, "save", nil, map[string]any{"message": "mkdir failed", "code": "internal_error"})
-					continue
-				}
-				if err := os.WriteFile(full, []byte(cnt), 0o644); err != nil {
-					_ = sendAck(c, projectID, "save", nil, map[string]any{"message": "write failed", "code": "internal_error"})
-					continue
-				}
-			}
-			_ = sendAck(c, projectID, "save", projectState.getLatestRevision(projectID), nil)
+
 		case "ping":
-			_ = c.WriteJSON(WSPong{Type: "pong", ProjectID: projectID, TS: time.Now().UTC().Format(time.RFC3339)})
-		default:
-			_ = sendAck(c, projectID, t, nil, map[string]any{"message": "unknown type", "code": "invalid_message"})
+			c.WriteJSON(WSPong{Type: "pong", ProjectID: projectID, TS: time.Now().UTC().Format(time.RFC3339)})
 		}
 	}
 }
@@ -1021,77 +744,36 @@ func handleWSProjects(w http.ResponseWriter, r *http.Request) {
 func watchJobStatus(ctx context.Context, c *websocket.Conn, projectID, jobID, rev string) {
 	statusPath := filepath.Join(projectDir(projectID), "compile", "status", jobID+".json")
 	logPath := filepath.Join(projectDir(projectID), "compile", "logs", jobID+".txt")
-	startedEmitted := false
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
-	start := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// read status json if exists
 			b, err := os.ReadFile(statusPath)
 			if err != nil {
 				continue
 			}
 			var s struct {
-				JobID     string `json:"jobId"`
-				ProjectID string `json:"projectId"`
-				State     string `json:"state"`
-				Revision  string `json:"revision"`
-				StartedAt string `json:"startedAt"`
-				Finished  string `json:"finishedAt"`
-				Duration  int64  `json:"durationMs"`
+				State      string `json:"state"`
+				StartedAt  string `json:"startedAt"`
+				FinishedAt string `json:"finishedAt"`
 			}
 			if json.Unmarshal(b, &s) != nil {
 				continue
 			}
 			now := time.Now().UTC().Format(time.RFC3339)
-			if !startedEmitted && (s.State == "running" || s.State == "success" || s.State == "failed") {
-				_ = c.WriteJSON(CompileStarted{Type: "compileStarted", ProjectID: projectID, TS: now, JobID: jobID, Revision: rev, StartedAt: s.StartedAt})
-				startedEmitted = true
-			}
-			// tail small chunk of log
-			tail := readTail(logPath, 4096)
-			if tail != "" && s.State == "running" {
-				_ = c.WriteJSON(CompileProgress{Type: "compileProgress", ProjectID: projectID, TS: now, JobID: jobID, Revision: rev, LogTail: tail, Message: tail})
-			}
 			switch s.State {
+			case "running":
+				c.WriteJSON(CompileStarted{Type: "compileStarted", ProjectID: projectID, TS: now, JobID: jobID, Revision: rev, StartedAt: s.StartedAt})
 			case "success":
-				_ = c.WriteJSON(CompileSucceeded{
-					Type:       "compileSucceeded",
-					ProjectID:  projectID,
-					TS:         now,
-					JobID:      jobID,
-					Revision:   rev,
-					PDFURL:     fmt.Sprintf("/files/%s/output.pdf", projectID),
-					Duration:   time.Since(start).Milliseconds(),
-					FinishedAt: s.Finished,
-					OutputPath: fmt.Sprintf("/files/%s/output.pdf", projectID),
-				})
+				c.WriteJSON(CompileSucceeded{Type: "compileSucceeded", ProjectID: projectID, TS: now, JobID: jobID, Revision: rev, OutputPath: "/files/" + projectID + "/output.pdf", FinishedAt: s.FinishedAt})
 				return
 			case "failed":
-				_ = c.WriteJSON(CompileFailed{
-					Type:       "compileFailed",
-					ProjectID:  projectID,
-					TS:         now,
-					JobID:      jobID,
-					Revision:   rev,
-					LogURL:     fmt.Sprintf("/files/%s/compile/logs/%s.txt", projectID, jobID),
-					Duration:   time.Since(start).Milliseconds(),
-					FinishedAt: s.Finished,
-					Error:      tail,
-				})
-				return
-			case "canceled", "superseded":
-				_ = c.WriteJSON(CompileCanceled{
-					Type:               "compileCanceled",
-					ProjectID:          projectID,
-					TS:                 now,
-					JobID:              jobID,
-					SupersededRevision: projectState.getLatestRevision(projectID),
-				})
+				logTail, _ := os.ReadFile(logPath)
+				c.WriteJSON(CompileFailed{Type: "compileFailed", ProjectID: projectID, TS: now, JobID: jobID, Revision: rev, Error: string(logTail), FinishedAt: s.FinishedAt})
 				return
 			}
 		}
@@ -1102,177 +784,35 @@ func enqueueJob(projectID, entryFile, engine, revision, requestor string) (strin
 	jobID := uuid()
 	root := projectDir(projectID)
 	job := map[string]any{
-		"jobId":       jobID,
-		"projectId":   projectID,
-		"entryFile":   entryFile,
-		"engine":      coalesce(engine, "pdflatex"),
-		"options":     []string{"-interaction=nonstopmode", "-halt-on-error"},
-		"cancelToken": revision,
-		"createdAt":   time.Now().UTC().Format(time.RFC3339),
-		"requestor":   requestor,
+		"jobId":     jobID,
+		"projectId": projectID,
+		"entryFile": entryFile,
+		"engine":    engine,
+		"revision":  revision,
 	}
 	b, _ := json.MarshalIndent(job, "", "  ")
 	qpath := filepath.Join(root, "compile", "queue", jobID+".json")
 	if err := os.WriteFile(qpath, b, 0o644); err != nil {
 		return "", err
 	}
-	// Start simulated compilation flow unless disabled via env
 	if isSimulationEnabled() {
 		go simulateCompilation(projectID, jobID, entryFile, engine, revision)
 	}
 	return jobID, nil
 }
 
-func writeCancelFile(projectID, jobID string) error {
-	return os.WriteFile(filepath.Join(projectDir(projectID), "compile", jobID+".cancel"), []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
-}
-
-// mustStat returns FileInfo or panics; only used inside zip stream where errors are ignored.
-func mustStat(f *os.File) os.FileInfo {
-	fi, err := f.Stat()
-	if err != nil {
-		panic(err)
-	}
-	return fi
-}
-
-// ----- Simulation helpers to make preview work without a real compiler -----
-
-func isSimulationEnabled() bool {
-	// Default disabled; enable only if SIMULATE_COMPILER is truthy
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("SIMULATE_COMPILER")))
-	return v == "1" || v == "true" || v == "on" || v == "yes"
-}
-
-func simulateCompilation(projectID, jobID, entryFile, engine, revision string) {
-	root := projectDir(projectID)
-	statusPath := filepath.Join(root, "compile", "status", jobID+".json")
-	logPath := filepath.Join(root, "compile", "logs", jobID+".txt")
-	started := time.Now().UTC()
-	// mark running
-	_ = writeStatusJSON(statusPath, map[string]any{
-		"jobId":     jobID,
-		"projectId": projectID,
-		"state":     "running",
-		"revision":  revision,
-		"startedAt": started.Format(time.RFC3339),
-	})
-	_ = appendLog(logPath, "Simulated compiler starting...\n")
-	// simulate reading entry file
-	full, ok := safeJoin(root, coalesce(entryFile, "main.tex"))
-	if !ok {
-		_ = appendLog(logPath, "Invalid entry file path\n")
-	}
-	if b, err := os.ReadFile(full); err == nil {
-		_ = appendLog(logPath, fmt.Sprintf("Read %s (%d bytes)\n", filepath.ToSlash(coalesce(entryFile, "main.tex")), len(b)))
-	} else {
-		_ = appendLog(logPath, "Entry file missing, continuing with placeholder PDF...\n")
-	}
-	// simulate work
-	time.Sleep(400 * time.Millisecond)
-	// write placeholder PDF only if a real output does not already exist
-	outPath := filepath.Join(root, "output.pdf")
-	if _, statErr := os.Stat(outPath); statErr == nil {
-		_ = appendLog(logPath, "Detected existing output.pdf; preserving real output.\n")
-	} else if err := writePlaceholderPDF(outPath); err != nil {
-		_ = appendLog(logPath, "Failed to write PDF: "+err.Error()+"\n")
-		finish := time.Now().UTC()
-		_ = writeStatusJSON(statusPath, map[string]any{
-			"jobId":      jobID,
-			"projectId":  projectID,
-			"state":      "failed",
-			"revision":   revision,
-			"startedAt":  started.Format(time.RFC3339),
-			"finishedAt": finish.Format(time.RFC3339),
-			"durationMs": finish.Sub(started).Milliseconds(),
-		})
-		return
-	}
-	_ = appendLog(logPath, "Wrote placeholder PDF output.pdf\n")
-	finish := time.Now().UTC()
-	_ = writeStatusJSON(statusPath, map[string]any{
-		"jobId":      jobID,
-		"projectId":  projectID,
-		"state":      "success",
-		"revision":   revision,
-		"startedAt":  started.Format(time.RFC3339),
-		"finishedAt": finish.Format(time.RFC3339),
-		"durationMs": finish.Sub(started).Milliseconds(),
-	})
-}
-
-func writeStatusJSON(path string, v map[string]any) error {
-	b, _ := json.Marshal(v)
-	return os.WriteFile(path, b, 0o644)
-}
-
-func appendLog(path, line string) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.WriteString(line)
-	return err
-}
-
-// Minimal valid PDF so the browser can render
-func writePlaceholderPDF(dst string) error {
-	// ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	content := "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 112>>stream\nBT /F1 20 Tf 72 720 Td (Placeholder PDF) Tj ET\nBT /F1 12 Tf 72 700 Td (Waiting for real LaTeX output...) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\nxref\n0 6\n0000000000 65535 f \n0000000010 00000 n \n0000000065 00000 n \n0000000122 00000 n \n0000000339 00000 n \n0000000557 00000 n \ntrailer<</Size 6/Root 1 0 R>>\nstartxref\n647\n%%EOF\n"
-	return os.WriteFile(dst, []byte(content), 0o644)
-}
-
-func readTail(p string, max int64) string {
-	f, err := os.Open(p)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil {
-		return ""
-	}
-	var start int64 = 0
-	if fi.Size() > max {
-		start = fi.Size() - max
-	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
-		return ""
-	}
-	sb := strings.Builder{}
-	br := bufio.NewReader(f)
-	for {
-		line, err := br.ReadString('\n')
-		sb.WriteString(line)
-		if err != nil {
-			break
-		}
-	}
-	return sb.String()
-}
-
-func handleWSAckError(c *websocket.Conn, projectID, op string, msg string) {
-	_ = sendAck(c, projectID, op, nil, map[string]any{"message": msg, "code": "invalid_message"})
-}
-
-func sendAck(c *websocket.Conn, projectID, op string, revision any, errObj map[string]any) error {
+func sendAck(c *websocket.Conn, projectID, op string, revision any, errObj map[string]any) {
 	ack := map[string]any{
 		"type":      "ack",
 		"projectId": projectID,
 		"ts":        time.Now().UTC().Format(time.RFC3339),
 		"op":        op,
-	}
-	if revision != nil {
-		ack["revision"] = revision
+		"revision":  revision,
 	}
 	if errObj != nil {
 		ack["error"] = errObj
 	}
-	return c.WriteJSON(ack)
+	c.WriteJSON(ack)
 }
 
 func loggingMiddleware(next http.Handler) http.Handler {
@@ -1288,45 +828,64 @@ func projectDir(projectID string) string {
 }
 
 func safeJoin(root, requested string) (string, bool) {
-	// Normalize to forward slashes, clean, and ensure relative (no leading slash)
 	cleanRel := path.Clean(filepath.ToSlash(requested))
-	// Remove any leading slash to keep it relative under root
-	cleanRel = strings.TrimPrefix(cleanRel, "/")
-	// Forbid path traversal
-	if cleanRel == ".." || strings.HasPrefix(cleanRel, "../") || strings.Contains(cleanRel, "/../") {
+	if strings.HasPrefix(cleanRel, "../") || strings.Contains(cleanRel, "/../") {
 		return "", false
 	}
 	full := filepath.Join(root, cleanRel)
-	full = filepath.Clean(full)
-	rootClean := filepath.Clean(root)
-	if !strings.HasPrefix(full, rootClean+string(os.PathSeparator)) && full != rootClean {
+	if !strings.HasPrefix(full, filepath.Clean(root)) {
 		return "", false
 	}
 	return full, true
 }
 
-func parseIntDefault(s string, d int) int {
-	if s == "" {
-		return d
-	}
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		return d
-	}
-	return i
+func isSimulationEnabled() bool {
+	v := os.Getenv("SIMULATE_COMPILER")
+	return v == "1" || strings.ToLower(v) == "true"
 }
 
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
+func simulateCompilation(projectID, jobID, entryFile, engine, revision string) {
+	time.Sleep(1 * time.Second)
+	root := projectDir(projectID)
+	statusPath := filepath.Join(root, "compile", "status", jobID+".json")
+	logPath := filepath.Join(root, "compile", "logs", jobID+".txt")
+
+	os.WriteFile(statusPath, []byte(`{"state":"running"}`), 0o644)
+	os.WriteFile(logPath, []byte("Simulation running...\n"), 0o644)
+	time.Sleep(2 * time.Second)
+
+	currentContent := projectState.buffers[projectID][coalesce(entryFile, "main.tex")]
+	writePlaceholderPDF(filepath.Join(root, "output.pdf"), currentContent)
+
+	os.WriteFile(statusPath, []byte(`{"state":"success"}`), 0o644)
 }
 
-func coalesce[T comparable](v T, def T) T {
+func writePlaceholderPDF(dst, content string) error {
+	// A minimal PDF structure
+	pdfContent := fmt.Sprintf(
+		"%%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"+
+			"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"+
+			"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n"+
+			"4 0 obj<</Length %d>>stream\nBT /F1 12 Tf 72 720 Td (%s) Tj ET\nendstream endobj\n"+
+			"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"+
+			"xref\n0 6\n0000000000 65535 f \n"+
+			"0000000010 00000 n \n0000000065 00000 n \n0000000122 00000 n \n"+
+			"0000000280 00000 n \n0000000425 00000 n \n"+
+			"trailer<</Size 6/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF",
+		len(content)+25, content, 515+len(content)-len("Hello, LaTeX Preview!"),
+	)
+	return os.WriteFile(dst, []byte(pdfContent), 0o644)
+}
+
+func uuid() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func coalesce[T comparable](v, def T) T {
 	var zero T
 	if v == zero {
 		return def
@@ -1339,14 +898,4 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
-}
-
-func uuid() string {
-	var b [16]byte
-	_, _ = rand.Read(b[:])
-	// Set version 4
-	b[6] = (b[6] & 0x0f) | 0x40
-	// Set variant
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }

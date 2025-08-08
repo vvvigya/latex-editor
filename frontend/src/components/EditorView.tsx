@@ -1,0 +1,210 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import WebSocketService from '../services/WebSocketService'
+import HealthBadge from './HealthBadge'
+
+// Config
+const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+const WS_BASE = `${WS_PROTOCOL}//${window.location.host}`
+
+type ServerMsg =
+  | { type: 'ack'; ackType: string; revision?: number | string; op?: string }
+  | { type: 'compileQueued'; jobId: string; revision: number }
+  | { type: 'compileStarted'; jobId: string; revision: number; startedAt: string }
+  | { type: 'compileProgress'; jobId: string; revision: number; message: string }
+  | { type: 'compileSucceeded'; jobId: string; revision: number; outputPath: string; finishedAt: string }
+  | { type: 'compileFailed'; jobId: string; revision: number; error: string; finishedAt: string }
+  | { type: 'compileCanceled'; jobId: string; revision: number; finishedAt: string }
+  | { type: 'pong' }
+
+function useDebounce() {
+  const handle = useRef<number | null>(null)
+  const debounce = useCallback((fn: () => void, ms: number) => {
+    if (handle.current) window.clearTimeout(handle.current)
+    handle.current = window.setTimeout(fn, ms)
+  }, [])
+  return { debounce }
+}
+
+type EditorViewProps = {
+  projectId: string;
+};
+
+const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
+  const [content, setContent] = useState<string>('')
+  const [revision, setRevision] = useState(0)
+  const [status, setStatus] = useState<string>('Loading...')
+  const [logs, setLogs] = useState<string[]>([])
+  const [pdfKey, setPdfKey] = useState(0)
+
+  const wsService = useRef<WebSocketService | null>(null)
+
+  useEffect(() => {
+    setContent('');
+    setRevision(0);
+    setLogs([]);
+    setStatus('Loading file...');
+
+    fetch(`/api/projects/${projectId}/files?path=main.tex`)
+      .then(res => res.json())
+      .then(data => {
+        if (data && typeof data.content === 'string') {
+          setContent(data.content)
+          setStatus('File loaded')
+        }
+      })
+      .catch(() => setStatus('Error loading file'));
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!projectId) return
+
+    const url = `${WS_BASE}/ws/projects/${projectId}`
+    wsService.current = new WebSocketService(url, {
+      onOpen: () => {
+        setStatus('Connected')
+        const initialRev = revision || 1
+        wsService.current?.sendMessage({ type: 'docUpdate', path: 'main.tex', content, revision: initialRev })
+      },
+      onMessage: (msg: ServerMsg) => {
+        switch (msg.type) {
+          case 'ack':
+            {
+              const rv = msg.revision
+              if (typeof rv === 'number') setRevision(rv)
+              else if (typeof rv === 'string') {
+                const n = parseInt(rv, 10)
+                if (!Number.isNaN(n)) setRevision(n)
+              }
+              const compileRev = typeof rv === 'number' ? rv : (typeof rv === 'string' ? parseInt(rv, 10) : undefined)
+              if (msg.op === 'docUpdate' && typeof compileRev === 'number' && !Number.isNaN(compileRev)) {
+                wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision: compileRev })
+              }
+            }
+            break
+          case 'compileQueued':
+            setStatus(`Queued r${msg.revision}`)
+            break
+          case 'compileStarted':
+            setStatus(`Compiling r${msg.revision}...`)
+            setLogs(l => [`[${new Date().toLocaleTimeString()}] Compile started...`, ...l]);
+            break
+          case 'compileProgress':
+            setLogs(l => [msg.message, ...l]);
+            break
+          case 'compileSucceeded':
+            setStatus(`Success r${msg.revision}`)
+            setLogs(l => [`[${new Date().toLocaleTimeString()}] PDF updated`, ...l]);
+            setPdfKey(k => k + 1)
+            break
+          case 'compileFailed':
+            setStatus(`Failed r${msg.revision}`)
+            setLogs(l => [`[${new Date().toLocaleTimeString()}] Error: ${msg.error}`, ...l]);
+            break
+          case 'compileCanceled':
+            setStatus(`Canceled r${msg.revision}`)
+            break
+          default:
+            break
+        }
+      },
+      onClose: () => {
+        setStatus('Disconnected')
+      },
+      onError: () => {
+        setStatus('WS error')
+      },
+    })
+    return () => {
+      wsService.current?.close()
+    }
+  }, [projectId, content])
+
+  const { debounce } = useDebounce()
+  const onChange = useCallback(
+    (next: string) => {
+      setContent(next)
+      setRevision(r => r + 1)
+      const rev = revision + 1
+      debounce(() => {
+        wsService.current?.sendMessage({ type: 'docUpdate', path: 'main.tex', content: next, revision: rev })
+      }, 700)
+    },
+    [debounce, revision],
+  )
+
+  const onSave = useCallback(async () => {
+    if (!projectId) return
+    setStatus('Saving...')
+    const r = await fetch(`/api/projects/${projectId}/files`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        files: [{ path: 'main.tex', content }],
+      }),
+    })
+    if (r.ok) {
+      setStatus('Saved, compiling...')
+      wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision })
+    } else {
+      setStatus(`Save failed: ${r.status}`)
+    }
+  }, [projectId, content, revision])
+
+  const onCompile = useCallback(() => {
+    wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision })
+  }, [revision])
+
+  const pdfSrc = useMemo(() => {
+    if (!projectId) return ''
+    return `/files/${projectId}/output.pdf?key=${pdfKey}&t=${Date.now()}`
+  }, [projectId, pdfKey])
+
+  return (
+    <main className="flex-1 flex flex-col bg-slate-100">
+      <header className="flex items-center justify-between p-4 bg-white border-b border-slate-200">
+        <h2 className="text-lg font-semibold text-slate-800">Project: {projectId}</h2>
+        <div className="flex items-center gap-4">
+          <span className="text-sm text-slate-600">Status: {status}</span>
+          <a href={`/api/projects/${projectId}/download`} className="text-sm font-medium text-blue-600 hover:underline">
+            Download ZIP
+          </a>
+          <HealthBadge />
+        </div>
+      </header>
+      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 p-4 overflow-hidden">
+        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+          <div className="flex items-center justify-between p-2 border-b border-slate-200">
+            <h3 className="text-sm font-semibold text-slate-600 px-2">main.tex</h3>
+            <div className="flex gap-2">
+              <button onClick={onSave} className="px-3 py-1 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 transition-colors">Save</button>
+              <button onClick={onCompile} className="px-3 py-1 bg-slate-200 text-sm rounded-md hover:bg-slate-300 transition-colors">Recompile</button>
+            </div>
+          </div>
+          <textarea
+            className="flex-1 w-full p-4 font-mono text-sm resize-none focus:outline-none"
+            value={content}
+            onChange={e => onChange(e.target.value)}
+            spellCheck={false}
+          />
+          <div className="border-t border-slate-200">
+            <h3 className="text-sm font-semibold text-slate-600 p-2">Logs</h3>
+            <pre className="h-32 p-2 bg-slate-50 text-xs overflow-y-auto">
+              {logs.join('\n')}
+            </pre>
+          </div>
+        </section>
+        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+          <h3 className="text-sm font-semibold text-slate-600 p-2 border-b border-slate-200">PDF Preview</h3>
+          <iframe
+            key={pdfKey}
+            title="PDF Preview"
+            src={pdfSrc}
+            className="w-full flex-1"
+          />
+        </section>
+      </div>
+    </main>
+  );
+};
+
+export default EditorView;
