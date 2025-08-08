@@ -5,8 +5,10 @@ import NewProjectModal from './components/NewProjectModal';
 import ImportProjectModal from './components/ImportProjectModal';
 import './App.css';
 
+type ActiveProject = { id: string; name: string } | null;
+
 function App() {
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [activeProject, setActiveProject] = useState<ActiveProject>(null);
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [refreshSidebar, setRefreshSidebar] = useState(false);
@@ -22,7 +24,7 @@ function App() {
       if (response.ok) {
         setIsNewProjectModalOpen(false);
         setRefreshSidebar(prev => !prev);
-        setActiveProjectId(newProject.id);
+        setActiveProject({ id: newProject.id, name: newProject.name || 'Untitled' });
       } else {
         alert(`Error creating project: ${newProject.error}`);
       }
@@ -44,7 +46,7 @@ function App() {
       if (response.ok) {
         setIsImportModalOpen(false);
         setRefreshSidebar(prev => !prev);
-        setActiveProjectId(newProject.id);
+        setActiveProject({ id: newProject.id, name: newProject.name || 'Imported project' });
       } else {
         alert(`Error importing project: ${newProject.error}`);
       }
@@ -57,14 +59,24 @@ function App() {
   return (
     <div className="flex h-screen bg-white text-slate-900">
       <Sidebar
-        onSelectProject={setActiveProjectId}
-        activeProjectId={activeProjectId}
+        onSelectProject={(p) => setActiveProject({ id: p.id, name: p.name })}
+        activeProjectId={activeProject?.id || null}
         onNewProject={() => setIsNewProjectModalOpen(true)}
         onImportProject={() => setIsImportModalOpen(true)}
         refresh={refreshSidebar}
+        onProjectDeleted={(id) => {
+          if (activeProject?.id === id) setActiveProject(null);
+        }}
       />
-      {activeProjectId ? (
-        <EditorView projectId={activeProjectId} />
+      {activeProject ? (
+        <EditorView
+          projectId={activeProject.id}
+          projectName={activeProject.name}
+          onProjectRenamed={(newName: string) => {
+            setActiveProject(prev => (prev ? { ...prev, name: newName } : prev));
+            setRefreshSidebar(prev => !prev);
+          }}
+        />
       ) : (
         <div className="flex-1 flex items-center justify-center text-slate-500">
           Select a project or create a new one to start

@@ -27,9 +27,11 @@ function useDebounce() {
 
 type EditorViewProps = {
   projectId: string;
+  projectName: string;
+  onProjectRenamed?: (newName: string) => void;
 };
 
-const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
+const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProjectRenamed }) => {
   const [content, setContent] = useState<string>('')
   const [revision, setRevision] = useState(0)
   const [status, setStatus] = useState<string>('Loading...')
@@ -37,6 +39,10 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
   const [pdfKey, setPdfKey] = useState(0)
   const [editorWidthPct, setEditorWidthPct] = useState<number>(60)
   const isResizingRef = useRef(false)
+  const [showLogs, setShowLogs] = useState<boolean>(true)
+  const [zoom, setZoom] = useState<number>(1)
+  const [nameEditing, setNameEditing] = useState<boolean>(false)
+  const [nameInput, setNameInput] = useState<string>(projectName)
 
   const wsService = useRef<WebSocketService | null>(null)
 
@@ -78,7 +84,8 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
                 if (!Number.isNaN(n)) setRevision(n)
               }
               const compileRev = typeof rv === 'number' ? rv : (typeof rv === 'string' ? parseInt(rv, 10) : undefined)
-              if (msg.op === 'docUpdate' && typeof compileRev === 'number' && !Number.isNaN(compileRev)) {
+              const ackType = (msg as any).ackType || (msg as any).op
+              if (ackType === 'docUpdate' && typeof compileRev === 'number' && !Number.isNaN(compileRev)) {
                 wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision: compileRev })
               }
             }
@@ -119,7 +126,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
     return () => {
       wsService.current?.close()
     }
-  }, [projectId, content])
+  }, [projectId])
 
   const { debounce } = useDebounce()
   const onChange = useCallback(
@@ -197,6 +204,10 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
     }
   }, [onResize, onStopResize])
 
+  useEffect(() => {
+    setNameInput(projectName)
+  }, [projectName])
+
   const onSave = useCallback(async () => {
     if (!projectId) return
     setStatus('Saving...')
@@ -224,10 +235,61 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
     return `/files/${projectId}/output.pdf?key=${pdfKey}&t=${Date.now()}`
   }, [projectId, pdfKey])
 
+  const onRenameSubmit = useCallback(async () => {
+    const newName = nameInput.trim()
+    if (!newName || newName === projectName) {
+      setNameEditing(false)
+      return
+    }
+    try {
+      const res = await fetch(`/api/projects/${projectId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName }),
+      })
+      if (res.ok) {
+        setStatus('Renamed project')
+        onProjectRenamed?.(newName)
+      } else {
+        setStatus('Rename not supported by server')
+        setNameInput(projectName)
+      }
+    } catch {
+      setStatus('Rename failed')
+      setNameInput(projectName)
+    } finally {
+      setNameEditing(false)
+    }
+  }, [nameInput, projectId, projectName, onProjectRenamed])
+
   return (
     <main className="flex-1 flex flex-col bg-slate-100">
       <header className="flex items-center justify-between p-4 bg-white border-b border-slate-200">
-        <h2 className="text-lg font-semibold text-slate-800">Project: {projectId}</h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold text-slate-800">Project:</h2>
+          {nameEditing ? (
+            <input
+              autoFocus
+              value={nameInput}
+              onChange={(e) => setNameInput(e.target.value)}
+              onBlur={onRenameSubmit}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') onRenameSubmit()
+                if (e.key === 'Escape') { setNameEditing(false); setNameInput(projectName) }
+              }}
+              className="px-2 py-1 border border-slate-300 rounded focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-slate-800"
+            />
+          ) : (
+            <button
+              className="text-lg font-semibold text-blue-700 hover:underline"
+              title="Click to rename"
+              onClick={() => setNameEditing(true)}
+            >
+              {nameInput}
+            </button>
+          )}
+          <span className="text-xs text-slate-500">({projectId})</span>
+        </div>
         <div className="flex items-center gap-4">
           <span className="text-sm text-slate-600">Status: {status}</span>
           <a href={`/api/projects/${projectId}/download`} className="text-sm font-medium text-blue-600 hover:underline">
@@ -247,6 +309,9 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
                 Upload files
                 <input type="file" multiple className="hidden" onChange={(e) => onUploadFiles(e.target.files)} accept=".tex,.bib,.sty,.cls,.txt,.csv,.json,.xml" />
               </label>
+              <button onClick={() => setShowLogs(s => !s)} className="px-3 py-1 bg-slate-100 text-sm rounded-md border border-slate-300 hover:bg-slate-200 transition-colors">
+                {showLogs ? 'Hide Logs' : 'Show Logs'}
+              </button>
             </div>
           </div>
           <textarea
@@ -255,12 +320,14 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
             onChange={e => onChange(e.target.value)}
             spellCheck={false}
           />
-          <div className="border-t border-slate-200">
-            <h3 className="text-sm font-semibold text-slate-600 p-2">Logs</h3>
-            <pre className="h-32 p-2 bg-slate-50 text-xs overflow-y-auto">
-              {logs.join('\n')}
-            </pre>
-          </div>
+          {showLogs && (
+            <div className="border-t border-slate-200">
+              <h3 className="text-sm font-semibold text-slate-600 p-2">Logs</h3>
+              <pre className="h-32 p-2 bg-slate-50 text-xs overflow-y-auto">
+                {logs.join('\n')}
+              </pre>
+            </div>
+          )}
         </section>
         <div
           className="w-1 bg-slate-200 hover:bg-slate-300 cursor-col-resize rounded self-stretch"
@@ -269,12 +336,23 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
         />
         <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden" style={{ width: `${100 - editorWidthPct}%` }}>
           <h3 className="text-sm font-semibold text-slate-600 p-2 border-b border-slate-200">PDF Preview</h3>
-          <iframe
-            key={pdfKey}
-            title="PDF Preview"
-            src={pdfSrc}
-            className="w-full flex-1"
-          />
+          <div className="flex items-center gap-2 px-2 pb-2 text-sm text-slate-600">
+            <span>Zoom</span>
+            <button className="px-2 py-0.5 border rounded" onClick={() => setZoom(z => Math.max(0.5, +(z - 0.1).toFixed(2)))}>-</button>
+            <span className="w-10 text-center">{Math.round(zoom * 100)}%</span>
+            <button className="px-2 py-0.5 border rounded" onClick={() => setZoom(z => Math.min(2, +(z + 0.1).toFixed(2)))}>+</button>
+            <button className="px-2 py-0.5 border rounded" onClick={() => setZoom(1)}>Reset</button>
+          </div>
+          <div className="flex-1 overflow-auto">
+            <div style={{ transform: `scale(${zoom})`, transformOrigin: 'top left' }}>
+              <iframe
+                key={pdfKey}
+                title="PDF Preview"
+                src={pdfSrc}
+                className="w-full h-[calc(100vh-260px)]"
+              />
+            </div>
+          </div>
         </section>
       </div>
     </main>

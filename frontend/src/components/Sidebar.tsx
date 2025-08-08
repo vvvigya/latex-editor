@@ -7,15 +7,17 @@ type Project = {
 };
 
 type SidebarProps = {
-  onSelectProject: (id: string) => void;
+  onSelectProject: (project: Project) => void;
   activeProjectId: string | null;
   onNewProject: () => void;
   onImportProject: () => void;
   refresh: boolean;
+  onProjectDeleted?: (id: string) => void;
 };
 
-const Sidebar: React.FC<SidebarProps> = ({ onSelectProject, activeProjectId, onNewProject, onImportProject, refresh }) => {
+const Sidebar: React.FC<SidebarProps> = ({ onSelectProject, activeProjectId, onNewProject, onImportProject, refresh, onProjectDeleted }) => {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [hasPdf, setHasPdf] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     fetch('/api/projects')
@@ -23,6 +25,35 @@ const Sidebar: React.FC<SidebarProps> = ({ onSelectProject, activeProjectId, onN
       .then(data => setProjects(data.projects || []))
       .catch(console.error);
   }, [refresh]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function probePdfs() {
+      const results: Record<string, boolean> = {};
+      await Promise.all(projects.map(async (p) => {
+        try {
+          const r = await fetch(`/files/${p.id}/output.pdf`, { method: 'HEAD' });
+          results[p.id] = r.ok;
+        } catch {
+          results[p.id] = false;
+        }
+      }));
+      if (!cancelled) setHasPdf(results);
+    }
+    if (projects.length > 0) probePdfs();
+    return () => { cancelled = true };
+  }, [projects]);
+
+  const handleDelete = async (id: string) => {
+    if (!confirm('Delete this project? This cannot be undone.')) return;
+    const r = await fetch(`/api/projects/${id}`, { method: 'DELETE' });
+    if (r.ok || r.status === 204) {
+      setProjects(prev => prev.filter(p => p.id !== id));
+      onProjectDeleted?.(id);
+    } else {
+      alert('Failed to delete project');
+    }
+  };
 
   return (
     <aside className="w-64 bg-slate-50 border-r border-slate-200 p-4 flex flex-col shrink-0">
@@ -49,17 +80,26 @@ const Sidebar: React.FC<SidebarProps> = ({ onSelectProject, activeProjectId, onN
         <ul className="space-y-1">
           {projects.map(project => (
             <li key={project.id}>
-              <a href="#"
-                 className={`block p-2 rounded-lg transition-colors duration-200 ${activeProjectId === project.id ? 'bg-blue-100 text-blue-700 shadow-sm' : 'hover:bg-slate-200 text-slate-700'}`}
-                 onClick={(e) => {
-                   e.preventDefault();
-                   onSelectProject(project.id);
-                 }}>
-                <div className="font-semibold">{project.name}</div>
-                <div className="text-xs text-slate-500">
-                  {new Date(project.lastModified).toLocaleDateString()}
+              <div className={`group flex items-center justify-between p-2 rounded-lg transition-colors duration-200 ${activeProjectId === project.id ? 'bg-blue-100 text-blue-700 shadow-sm' : 'hover:bg-slate-200 text-slate-700'}`}>
+                <a href="#"
+                   className="flex-1 min-w-0"
+                   onClick={(e) => {
+                     e.preventDefault();
+                     onSelectProject(project);
+                   }}>
+                  <div className="font-semibold truncate flex items-center gap-2">
+                    <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: hasPdf[project.id] ? '#16a34a' : '#94a3b8' }} title={hasPdf[project.id] ? 'PDF available' : 'No PDF yet'} />
+                    {project.name}
+                  </div>
+                  <div className="text-xs text-slate-500">
+                    {new Date(project.lastModified).toLocaleDateString()}
+                  </div>
+                </a>
+                <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-2 ml-2">
+                  <a href={`/api/projects/${project.id}/download`} className="text-xs px-2 py-1 rounded bg-slate-200 hover:bg-slate-300">ZIP</a>
+                  <button onClick={() => handleDelete(project.id)} className="text-xs px-2 py-1 rounded bg-red-100 text-red-700 hover:bg-red-200">Delete</button>
                 </div>
-              </a>
+              </div>
             </li>
           ))}
         </ul>
