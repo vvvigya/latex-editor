@@ -35,6 +35,8 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
   const [status, setStatus] = useState<string>('Loading...')
   const [logs, setLogs] = useState<string[]>([])
   const [pdfKey, setPdfKey] = useState(0)
+  const [editorWidthPct, setEditorWidthPct] = useState<number>(60)
+  const isResizingRef = useRef(false)
 
   const wsService = useRef<WebSocketService | null>(null)
 
@@ -132,6 +134,69 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
     [debounce, revision],
   )
 
+  const onUploadFiles = useCallback(async (files: FileList | null) => {
+    if (!files || files.length === 0) return
+    const textLike = ['text/', 'application/json', 'application/xml']
+    setStatus('Uploading files...')
+    const uploadBodies: { path: string; content: string }[] = []
+    for (const file of Array.from(files)) {
+      const isText = textLike.some(prefix => file.type.startsWith(prefix)) || file.name.endsWith('.tex') || file.name.endsWith('.bib') || file.name.endsWith('.sty') || file.name.endsWith('.cls') || file.name.endsWith('.txt') || file.name.endsWith('.csv')
+      if (!isText) {
+        setLogs(l => [`[${new Date().toLocaleTimeString()}] Skipped non-text file: ${file.name}`, ...l])
+        continue
+      }
+      const text = await file.text()
+      uploadBodies.push({ path: `assets/${file.name}`, content: text })
+    }
+    if (uploadBodies.length === 0) {
+      setStatus('No compatible files to upload')
+      return
+    }
+    try {
+      const r = await fetch(`/api/projects/${projectId}/files`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ files: uploadBodies }),
+      })
+      if (r.ok) {
+        setStatus('Files uploaded')
+        setLogs(l => [`[${new Date().toLocaleTimeString()}] Uploaded: ${uploadBodies.map(u => u.path).join(', ')}`, ...l])
+      } else {
+        setStatus(`Upload failed: ${r.status}`)
+      }
+    } catch (e) {
+      setStatus('Upload failed')
+    }
+  }, [projectId])
+
+  // Resizer handlers
+  const onStartResize = useCallback(() => {
+    isResizingRef.current = true
+    document.body.style.cursor = 'col-resize'
+  }, [])
+  const onStopResize = useCallback(() => {
+    isResizingRef.current = false
+    document.body.style.cursor = ''
+  }, [])
+  const onResize = useCallback((e: MouseEvent) => {
+    if (!isResizingRef.current) return
+    const container = document.getElementById('editor-preview-container')
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const pct = Math.min(80, Math.max(20, ((e.clientX - rect.left) / rect.width) * 100))
+    setEditorWidthPct(pct)
+  }, [])
+  useEffect(() => {
+    const move = (e: MouseEvent) => onResize(e)
+    const up = () => onStopResize()
+    window.addEventListener('mousemove', move)
+    window.addEventListener('mouseup', up)
+    return () => {
+      window.removeEventListener('mousemove', move)
+      window.removeEventListener('mouseup', up)
+    }
+  }, [onResize, onStopResize])
+
   const onSave = useCallback(async () => {
     if (!projectId) return
     setStatus('Saving...')
@@ -171,13 +236,17 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
           <HealthBadge />
         </div>
       </header>
-      <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 p-4 overflow-hidden">
-        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+      <div id="editor-preview-container" className="flex-1 flex flex-row gap-4 p-4 overflow-hidden">
+        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden" style={{ width: `${editorWidthPct}%` }}>
           <div className="flex items-center justify-between p-2 border-b border-slate-200">
             <h3 className="text-sm font-semibold text-slate-600 px-2">main.tex</h3>
             <div className="flex gap-2">
               <button onClick={onSave} className="px-3 py-1 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700 transition-colors">Save</button>
               <button onClick={onCompile} className="px-3 py-1 bg-slate-200 text-sm rounded-md hover:bg-slate-300 transition-colors">Recompile</button>
+              <label className="px-3 py-1 bg-slate-100 text-sm rounded-md border border-slate-300 cursor-pointer hover:bg-slate-200 transition-colors">
+                Upload files
+                <input type="file" multiple className="hidden" onChange={(e) => onUploadFiles(e.target.files)} accept=".tex,.bib,.sty,.cls,.txt,.csv,.json,.xml" />
+              </label>
             </div>
           </div>
           <textarea
@@ -193,7 +262,12 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId }) => {
             </pre>
           </div>
         </section>
-        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden">
+        <div
+          className="w-1 bg-slate-200 hover:bg-slate-300 cursor-col-resize rounded self-stretch"
+          onMouseDown={onStartResize}
+          title="Drag to resize"
+        />
+        <section className="flex flex-col bg-white rounded-lg shadow-sm border border-slate-200 overflow-hidden" style={{ width: `${100 - editorWidthPct}%` }}>
           <h3 className="text-sm font-semibold text-slate-600 p-2 border-b border-slate-200">PDF Preview</h3>
           <iframe
             key={pdfKey}

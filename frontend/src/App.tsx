@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import Sidebar from './components/Sidebar';
 import EditorView from './components/EditorView';
 import NewProjectModal from './components/NewProjectModal';
