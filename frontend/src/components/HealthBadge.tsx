@@ -18,9 +18,10 @@ export default function HealthBadge() {
         setStatus('unreachable')
         setMessage(`${res.status} ${txt}`)
       }
-    } catch (e: any) {
+    } catch (e: unknown) {
       setStatus('unreachable')
-      setMessage(e?.message || 'error')
+      const msg = e instanceof Error ? e.message : 'error'
+      setMessage(msg)
     }
   }
 

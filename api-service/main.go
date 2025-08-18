@@ -811,6 +811,7 @@ func sendAck(c *websocket.Conn, projectID, op string, revision any, errObj map[s
 		"type":      "ack",
 		"projectId": projectID,
 		"ts":        time.Now().UTC().Format(time.RFC3339),
+		"ackType":   op,
 		"op":        op,
 		"revision":  revision,
 	}
