@@ -36,6 +36,7 @@ var (
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	projectState = newProjectState()
+	serverStart  = time.Now()
 )
 
 type Project struct {
@@ -282,7 +283,11 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func handleVersion(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	writeJSON(w, http.StatusOK, map[string]string{"api": version})
+	info := map[string]string{
+		"api":    version,
+		"uptime": time.Since(serverStart).String(),
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -806,6 +811,7 @@ func sendAck(c *websocket.Conn, projectID, op string, revision any, errObj map[s
 		"type":      "ack",
 		"projectId": projectID,
 		"ts":        time.Now().UTC().Format(time.RFC3339),
+		"ackType":   op,
 		"op":        op,
 		"revision":  revision,
 	}

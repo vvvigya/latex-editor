@@ -84,7 +84,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
                 if (!Number.isNaN(n)) setRevision(n)
               }
               const compileRev = typeof rv === 'number' ? rv : (typeof rv === 'string' ? parseInt(rv, 10) : undefined)
-              const ackType = (msg as any).ackType || (msg as any).op
+              const ackType = (msg as { ackType?: string; op?: string }).ackType || (msg as { ackType?: string; op?: string }).op
               if (ackType === 'docUpdate' && typeof compileRev === 'number' && !Number.isNaN(compileRev)) {
                 wsService.current?.sendMessage({ type: 'requestCompile', path: 'main.tex', revision: compileRev })
               }
@@ -171,7 +171,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
       } else {
         setStatus(`Upload failed: ${r.status}`)
       }
-    } catch (e) {
+    } catch {
       setStatus('Upload failed')
     }
   }, [projectId])
