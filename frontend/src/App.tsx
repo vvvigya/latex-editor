@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import Sidebar from './components/Sidebar';
 import EditorView from './components/EditorView';
 import NewProjectModal from './components/NewProjectModal';
@@ -12,6 +12,7 @@ function App() {
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [refreshSidebar, setRefreshSidebar] = useState(false);
+  const [apiVersion, setApiVersion] = useState('');
 
   const handleCreateProject = useCallback(async (name: string, template: string) => {
     try {
@@ -56,6 +57,13 @@ function App() {
     }
   }, []);
 
+  useEffect(() => {
+    fetch('/api/version')
+      .then((r) => r.json())
+      .then((data) => setApiVersion(data.api || ''))
+      .catch(() => setApiVersion(''));
+  }, []);
+
   return (
     <div className="flex h-screen bg-white text-slate-900">
       <Sidebar
@@ -92,6 +100,11 @@ function App() {
         onClose={() => setIsImportModalOpen(false)}
         onImport={handleImportProject}
       />
+      {apiVersion && (
+        <div className="absolute bottom-2 right-2 text-xs text-slate-400">
+          API v{apiVersion}
+        </div>
+      )}
     </div>
   );
 }
