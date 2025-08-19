@@ -28,6 +28,7 @@ const (
 	defaultAPIPort   = "8080"
 	version          = "1.0.0"
 	maxDocUpdateSize = 2 * 1024 * 1024 // 2MB
+	sessionCookie    = "session"
 )
 
 var (
@@ -37,7 +38,14 @@ var (
 	}
 	projectState = newProjectState()
 	serverStart  = time.Now()
+	userMu       sync.Mutex
+	users        = map[string]*User{}
 )
+
+type User struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
 
 type Project struct {
 	ProjectID    string    `json:"id"`
@@ -47,6 +55,7 @@ type Project struct {
 	Engine       string    `json:"engine,omitempty"`
 	EntryFile    string    `json:"entryFile,omitempty"`
 	LastModified time.Time `json:"lastModified"`
+	OwnerID      string    `json:"ownerId"`
 }
 
 type FileInfo struct {
@@ -209,6 +218,7 @@ type ProjectDetail struct {
 	Engine    string     `json:"engine"`
 	EntryFile string     `json:"entryFile"`
 	Files     []FileInfo `json:"files"`
+	OwnerID   string     `json:"ownerId"`
 }
 
 // In-memory project registry and latest revision
@@ -259,6 +269,9 @@ func main() {
 
 	mux.HandleFunc(apiPrefix+"/health", handleHealth)
 	mux.HandleFunc(apiPrefix+"/version", handleVersion)
+	mux.HandleFunc(apiPrefix+"/login", handleLogin)
+	mux.HandleFunc(apiPrefix+"/logout", handleLogout)
+	mux.HandleFunc(apiPrefix+"/me", handleMe)
 	mux.HandleFunc(apiPrefix+"/projects", routeProjects)
 	mux.HandleFunc(apiPrefix+"/projects/import", handleImportProject)
 	mux.HandleFunc(apiPrefix+"/projects/", routeProjectByID)
@@ -344,18 +357,97 @@ func genToken() string {
 	return uuid()
 }
 
+func currentUser(r *http.Request) *User {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil {
+		return nil
+	}
+	userMu.Lock()
+	defer userMu.Unlock()
+	return users[c.Value]
+}
+
+func requireAuth(w http.ResponseWriter, r *http.Request) *User {
+	u := currentUser(r)
+	if u == nil {
+		writeJSON(w, http.StatusUnauthorized, ErrorBody{"unauthorized", "unauthorized"})
+	}
+	return u
+}
+
 func routeProjects(w http.ResponseWriter, r *http.Request) {
+	user := requireAuth(w, r)
+	if user == nil {
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
-		handleCreateProject(w, r)
+		handleCreateProject(w, r, user)
 	case http.MethodGet:
-		handleListProjects(w, r)
+		handleListProjects(w, r, user)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
 	}
 }
 
+type loginBody struct {
+	Name string `json:"name"`
+}
+
+func handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
+		return
+	}
+	var body loginBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
+		return
+	}
+	id := uuid()
+	user := &User{ID: id, Name: body.Name}
+	userMu.Lock()
+	users[id] = user
+	userMu.Unlock()
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    id,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(w, http.StatusOK, user)
+}
+
+func handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:    sessionCookie,
+		Value:   "",
+		Path:    "/",
+		Expires: time.Unix(0, 0),
+		MaxAge:  -1,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func handleMe(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
+	if user == nil {
+		writeJSON(w, http.StatusUnauthorized, ErrorBody{"unauthorized", "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, user)
+}
+
 func handleImportProject(w http.ResponseWriter, r *http.Request) {
+	user := requireAuth(w, r)
+	if user == nil {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, ErrorBody{"method not allowed", "method_not_allowed"})
 		return
@@ -385,6 +477,7 @@ func handleImportProject(w http.ResponseWriter, r *http.Request) {
 		LastModified: now,
 		Engine:       "pdflatex",
 		EntryFile:    "main.tex",
+		OwnerID:      user.ID,
 	}
 
 	root := projectDir(id)
@@ -457,6 +550,10 @@ func createCompileDirs(root string) {
 }
 
 func routeProjectByID(w http.ResponseWriter, r *http.Request) {
+	user := requireAuth(w, r)
+	if user == nil {
+		return
+	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, apiPrefix+"/projects/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"missing projectId", "invalid_request"})
@@ -464,10 +561,16 @@ func routeProjectByID(w http.ResponseWriter, r *http.Request) {
 	}
 	projectID := parts[0]
 
+	p := getProject(projectID)
+	if p == nil || p.OwnerID != user.ID {
+		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
+		return
+	}
+
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:
-			handleGetProject(w, r, projectID)
+			writeJSON(w, http.StatusOK, p)
 		case http.MethodDelete:
 			handleDeleteProject(w, r, projectID)
 		default:
@@ -537,7 +640,7 @@ func handleProjectDownload(w http.ResponseWriter, r *http.Request, projectID str
 	})
 }
 
-func handleCreateProject(w http.ResponseWriter, r *http.Request) {
+func handleCreateProject(w http.ResponseWriter, r *http.Request, user *User) {
 	var body ProjectsCreateBody
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, ErrorBody{"invalid json", "bad_json"})
@@ -557,6 +660,7 @@ func handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		LastModified: now,
 		Engine:       "pdflatex",
 		EntryFile:    "main.tex",
+		OwnerID:      user.ID,
 	}
 
 	root := projectDir(id)
@@ -573,23 +677,16 @@ func handleCreateProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, p)
 }
 
-func handleListProjects(w http.ResponseWriter, r *http.Request) {
+func handleListProjects(w http.ResponseWriter, r *http.Request, user *User) {
 	projectState.mu.RLock()
 	defer projectState.mu.RUnlock()
 	var list []*Project
 	for _, p := range projectState.projects {
-		list = append(list, p)
+		if p.OwnerID == user.ID {
+			list = append(list, p)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"projects": list})
-}
-
-func handleGetProject(w http.ResponseWriter, r *http.Request, projectID string) {
-	p := getProject(projectID)
-	if p == nil {
-		writeJSON(w, http.StatusNotFound, ErrorBody{"not found", "not_found"})
-		return
-	}
-	writeJSON(w, http.StatusOK, p)
 }
 
 func handleDeleteProject(w http.ResponseWriter, r *http.Request, projectID string) {
