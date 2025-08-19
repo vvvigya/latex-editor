@@ -9,7 +9,7 @@ export default function HealthBadge() {
   const check = async () => {
     try {
       // Use relative path for health check, handled by Vite proxy
-      const res = await fetch(`/api/health`, { cache: 'no-store' })
+      const res = await fetch(`/api/health`, { cache: 'no-store', credentials: 'include' })
       const txt = await res.text()
       if (res.ok && txt.trim() === 'ok') {
         setStatus('healthy')

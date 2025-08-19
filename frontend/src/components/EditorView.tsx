@@ -52,7 +52,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
     setLogs([]);
     setStatus('Loading file...');
 
-    fetch(`/api/projects/${projectId}/files?path=main.tex`)
+    fetch(`/api/projects/${projectId}/files?path=main.tex`, { credentials: 'include' })
       .then(res => res.json())
       .then(data => {
         if (data && typeof data.content === 'string') {
@@ -164,6 +164,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ files: uploadBodies }),
+        credentials: 'include',
       })
       if (r.ok) {
         setStatus('Files uploaded')
@@ -217,6 +218,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
       body: JSON.stringify({
         files: [{ path: 'main.tex', content }],
       }),
+      credentials: 'include',
     })
     if (r.ok) {
       setStatus('Saved, compiling...')
@@ -246,6 +248,7 @@ const EditorView: React.FC<EditorViewProps> = ({ projectId, projectName, onProje
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: newName }),
+        credentials: 'include',
       })
       if (res.ok) {
         setStatus('Renamed project')

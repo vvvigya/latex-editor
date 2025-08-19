@@ -6,6 +6,7 @@ import ImportProjectModal from './components/ImportProjectModal';
 import './App.css';
 
 type ActiveProject = { id: string; name: string } | null;
+type User = { id: string; name: string } | null;
 
 function App() {
   const [activeProject, setActiveProject] = useState<ActiveProject>(null);
@@ -13,6 +14,36 @@ function App() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [refreshSidebar, setRefreshSidebar] = useState(false);
   const [apiVersion, setApiVersion] = useState('');
+  const [user, setUser] = useState<User>(null);
+
+  const handleLogin = useCallback(async (name: string) => {
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const u = await res.json();
+        setUser(u);
+        setRefreshSidebar(prev => !prev);
+      }
+    } catch (e) {
+      console.error('login failed', e);
+    }
+  }, []);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await fetch('/api/logout', { method: 'POST', credentials: 'include' });
+    } catch {
+      /* ignore */
+    }
+    setUser(null);
+    setRefreshSidebar(prev => !prev);
+    setActiveProject(null);
+  }, []);
 
   const handleCreateProject = useCallback(async (name: string, template: string) => {
     try {
@@ -20,6 +51,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name, template }),
+        credentials: 'include',
       });
       const newProject = await response.json();
       if (response.ok) {
@@ -42,6 +74,7 @@ function App() {
       const response = await fetch('/api/projects/import', {
         method: 'POST',
         body: formData,
+        credentials: 'include',
       });
       const newProject = await response.json();
       if (response.ok) {
@@ -58,15 +91,22 @@ function App() {
   }, []);
 
   useEffect(() => {
-    fetch('/api/version')
+    fetch('/api/version', { credentials: 'include' })
       .then((r) => r.json())
       .then((data) => setApiVersion(data.api || ''))
       .catch(() => setApiVersion(''));
+    fetch('/api/me', { credentials: 'include' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(u => setUser(u))
+      .catch(() => setUser(null));
   }, []);
 
   return (
     <div className="flex h-screen bg-white text-slate-900">
       <Sidebar
+        user={user}
+        onLogin={handleLogin}
+        onLogout={handleLogout}
         onSelectProject={(p) => setActiveProject({ id: p.id, name: p.name })}
         activeProjectId={activeProject?.id || null}
         onNewProject={() => setIsNewProjectModalOpen(true)}
